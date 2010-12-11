@@ -1,0 +1,12 @@
+---
+require: "blogos/article"
+classname: Blogos
+epub_filename: blogos.epub
+title: null
+author: "Blogos"
+publisher: "Livedoor Blogos"
+uuid: null
+urls: |
+  http://news.livedoor.com/article/detail/5201417/
+  http://news.livedoor.com/article/detail/5201278/
+  http://news.livedoor.com/article/detail/5061847/
