@@ -11,7 +11,6 @@ require "zip/zip"
 $: << File.join(File.dirname(__FILE__), "lib")
 require "http/factory"
 require "http/message_pack_store"
-require "techon/article"
 
 def create_http_client(logger)
   store = HttpClient::MessagePackStore.new(File.join(File.dirname(__FILE__), "cache"))
@@ -30,20 +29,61 @@ def create_logger
   return logger
 end
 
+def file_read filename
+  return File.open(filename,        "rb") { |file| file.read }
+end
+
+def erb_result erb_filename, hash = nil, &block
+  template = file_read erb_filename
+
+  obj = Object.new
+  m = Module.new do |m|
+    if block_given? then
+      define_method :call, block
+    end
+    if hash then
+      hash.each do |key, value|
+        define_method key.to_sym do
+          value
+        end
+      end
+    end
+  end
+  obj.extend ERB::Util
+  obj.extend m
+  obj.call if block_given?
+  if hash then
+    hash.each do |key, value|
+      obj.instance_variable_set "@#{key}", value
+    end
+  end
+  b = obj.instance_eval { binding}
+  erb = ERB.new(template, nil, "-")
+  erb.filename = erb_filename
+  result = erb.result( b )
+  return result
+end
+
+yaml_filename = ARGV.shift
+yaml_filename ||= "techon.yaml"
 logger = create_logger
 http   = create_http_client(logger)
 
-manifest = YAML.load_file("techon.yaml")
+manifest  = YAML.load_file(yaml_filename)
+require manifest["require"]
 uuid      = manifest["uuid"]      || UUID.new.generate
 title     = manifest["title"]     || Time.now.strftime("%Y-%m-%d %H:%M:%S")
 author    = manifest["author"]    || "Unknown"
 publisher = manifest["publisher"] || nil
 urls      = manifest["urls"].split(/\s+/)
+epub_filename  = manifest["epub_filename"]
+klass     = self.class.const_get(manifest["classname"])
+Article   = klass.const_get("Article")
 
 image_count = 0
 
 articles = urls.each_with_index.map { |url, index|
-  article = TechOn::Article.get(http, url)
+  article = Article.get(http, url)
   article["id"] = "text#{index + 1}"
   article["images"].each { |image|
     image_count += 1
@@ -53,11 +93,8 @@ articles = urls.each_with_index.map { |url, index|
 }.sort_by { |article| article["published_time"] }
 
 
-mimetype        = File.open("template/mimetype",        "rb") { |file| file.read }
-container_xml   = File.open("template/container.xml",   "rb") { |file| file.read }
-content_opf_erb = File.open("template/content.opf.erb", "rb") { |file| file.read }
-toc_ncx_erb     = File.open("template/toc.ncx.erb",     "rb") { |file| file.read }
-toc_xhtml_erb   = File.open("template/toc.xhtml.erb",   "rb") { |file| file.read }
+mimetype        = file_read "template/mimetype"
+container_xml   = file_read "template/container.xml"
 
 opf_items = [
   {:id => "toc", :href => "toc.xhtml", :type => "application/xhtml+xml"},
@@ -72,54 +109,54 @@ articles.each { |article|
 opf_itemrefs = [{:idref => "toc"}]
 opf_itemrefs += articles.map { |article| {:idref => article["id"]} }
 
-env = Object.new.instance_eval {
+content_opf = erb_result "template/content.opf.erb" do
   @uuid      = CGI.escapeHTML(uuid)
   @title     = CGI.escapeHTML(title)
   @author    = CGI.escapeHTML(author)
   @publisher = CGI.escapeHTML(publisher)
   @items     = opf_items
   @itemrefs  = opf_itemrefs
-  binding
-}
-content_opf = ERB.new(content_opf_erb, nil, "-").result(env)
+end
 
-
-env = Object.new.instance_eval {
+toc_ncx = erb_result "template/toc.ncx.erb" do
   @uuid      = CGI.escapeHTML(uuid)
   @title     = CGI.escapeHTML(title)
   @author    = CGI.escapeHTML(author)
   @nav_points = articles.map { |article|
-    {:label_text => article["title"], :content_src => article["filename"]}
+    { :label_text => article["title"],
+      :content_src => article["filename"]}
   }
-  binding
-}
-toc_ncx = ERB.new(toc_ncx_erb, nil, "-").result(env)
+end
 
-env = Object.new.instance_eval {
+toc_xhtml = erb_result "template/toc.xhtml.erb" do
   @articles = articles.map { |article|
-    [CGI.escapeHTML(article["title"]), CGI.escapeHTML(article["filename"])]
+    [CGI.escapeHTML(article["title"]),
+        CGI.escapeHTML(article["filename"])]
   }
-  binding
-}
-toc_xhtml = ERB.new(toc_xhtml_erb, nil, "-").result(env)
+end
 
 
-filename = "techon.epub"
+filename = epub_filename
 File.unlink(filename) if File.exist?(filename)
 Zip::ZipFile.open(filename, Zip::ZipFile::CREATE) { |zip|
+  def zip.output filename, body
+    self.get_output_stream filename do |io|
+      io.write body
+    end
+  end
   # FIXME: mimetypeは無圧縮でなければならない
   # FIXME: mimetypeはアーカイブの先頭に現れなければならない
-  zip.get_output_stream("mimetype") { |io| io.write(mimetype) }
-  zip.get_output_stream("META-INF/container.xml") { |io| io.write(container_xml) }
-  zip.get_output_stream("OEBPS/content.opf") { |io| io.write(content_opf) }
-  zip.get_output_stream("OEBPS/toc.ncx") { |io| io.write(toc_ncx) }
-  zip.get_output_stream("OEBPS/toc.xhtml") { |io| io.write(toc_xhtml) }
+  zip.output "mimetype", mimetype
+  zip.output "META-INF/container.xml", container_xml
+  zip.output "OEBPS/content.opf", content_opf
+  zip.output "OEBPS/toc.ncx", toc_ncx
+  zip.output "OEBPS/toc.xhtml", toc_xhtml
   articles.each { |article|
-    zip.get_output_stream("OEBPS/" + article["filename"]) { |io| io.write(article["file"]) }
+    zip.output"OEBPS/" + article["filename"], article["file"]
   }
   articles.each { |article|
     article["images"].each { |image|
-      zip.get_output_stream("OEBPS/" + image["filename"]) { |io| io.write(image["file"]) }
+      zip.output"OEBPS/" + image["filename"], image["file"]
     }
   }
 }
